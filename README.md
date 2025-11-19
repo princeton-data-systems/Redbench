@@ -4,7 +4,7 @@
 [![uv](https://img.shields.io/badge/dependency%20manager-uv-orange.svg)](https://github.com/astral-sh/uv)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Release](https://img.shields.io/badge/release-1.0-blue.svg)]()
-<!-- [![Paper](https://img.shields.io/badge/paper-arXiv-red.svg)]() -->
+[![Paper](https://img.shields.io/badge/paper-arXiv-red.svg)](https://arxiv.org/pdf/2511.13059)
 
 # Redbench - Workload Synthesis From Cloud Traces
 <img src="redbench.png" alt="banner" width="600">
@@ -13,6 +13,8 @@
 
 Sourcecode of the paper *Redbench:  Workload Synthesis From Cloud Traces*
 The sourcecode for the evaluation sections of *Redbench* can be found here [https://github.com/DataManagementLab/Redbench-Eval](https://github.com/DataManagementLab/Redbench-Eval).
+
+A pre-print of the paper can be found here: [arxiv](https://arxiv.org/pdf/2511.13059)
 
 ## Overview
 Redbench is a flexible workload generator for database benchmarking, supporting both query matching and synthetic workload generation.
