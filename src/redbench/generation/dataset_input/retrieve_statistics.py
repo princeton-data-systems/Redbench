@@ -38,10 +38,9 @@ def get_table_row_count(con, table_name: str):
     return con.execute(query).fetchone()[0]
 
 
-def get_column_statistics(con, table_name: str, column_name: str, data_type: str):
-    quantiles = [i / 100 for i in range(1, 101)]
+def get_column_statistics(con, table_name: str, column_name: str, data_type: str, num_quantiles: int = 1000):
+    quantile_fractions = [i / num_quantiles for i in range(0, num_quantiles + 1)]
 
-    labels = ["q_0"] + [f"q_{i}" for i in range(100)] + ["q_100"]
     # Handle numeric types (e.g., INTEGER, DECIMAL, etc.)
     if any(
         numeric_type in data_type
@@ -54,78 +53,66 @@ def get_column_statistics(con, table_name: str, column_name: str, data_type: str
             "NUMERIC",
         )
     ):
-        quantile_queries = [
-            f"PERCENTILE_CONT({p}) WITHIN GROUP (ORDER BY {column_name}) AS q_{i}"
-            for i, p in enumerate(quantiles)
-        ]
+        fractions_str = ", ".join(str(f) for f in quantile_fractions)
         query = f"""
-            SELECT 
-                MIN({column_name}) AS min_value,
-                {", ".join(quantile_queries)},
-                MAX({column_name}) AS max_value
+            SELECT quantile_cont("{column_name}", [{fractions_str}])
             FROM {table_name};
         """
         result = con.execute(query).fetchone()
+        if result is None or result[0] is None:
+            return None
+        quantile_values = list(result[0])
 
-        assert result is not None, (
-            f"Failed to fetch statistics for {column_name} in {table_name} with data type {data_type} / {query}"
-        )
-
-        stats = dict(zip(labels, result))
-
-    # Handle string types (e.g., VARCHAR, TEXT, STRING), returning the actual string value for quantiles
+    # Handle string types (e.g., VARCHAR, TEXT, STRING)
     elif any(string_type in data_type for string_type in ("VARCHAR", "TEXT", "STRING")):
-        # Use ROW_NUMBER() to calculate the quantiles by ordering strings lexicographically
+        # Use quantile_disc which supports string types in DuckDB
+        fractions_str = ", ".join(str(f) for f in quantile_fractions)
         query = f"""
-            WITH ordered_strings AS (
-                SELECT {column_name}, ROW_NUMBER() OVER (ORDER BY {column_name}) AS row_num, COUNT(*) OVER () AS total_rows
-                FROM {table_name}
-            )
-            SELECT 
-                MIN({column_name}) AS min_value,
-                {", ".join([f"MAX(CASE WHEN row_num = CAST(total_rows * {p} AS INTEGER) THEN {column_name} END) AS q_{i}" for i, p in enumerate(quantiles)])},
-                MAX({column_name}) AS max_value
-            FROM ordered_strings;
+            SELECT quantile_disc("{column_name}", [{fractions_str}])
+            FROM {table_name};
         """
         result = con.execute(query).fetchone()
-        # Post-process the result to handle NULL values
-        result_list = list(result)  # Convert tuple to list for easier manipulation
+        if result is None or result[0] is None:
+            return None
+        quantile_values = list(result[0])
 
-        # Iterate through the quantiles and replace NULL values with the next non-null value
-        for i in range(len(result_list)):
-            if result_list[i] is None and i + 1 < len(
-                result_list
-            ):  # Only look ahead if there's another value
-                for j in range(i + 1, len(result_list)):
-                    if result_list[j] is not None:
-                        result_list[i] = result_list[
-                            j
-                        ]  # Replace with the next non-null value
+        # Fill None values forward
+        for i in range(len(quantile_values)):
+            if quantile_values[i] is None and i + 1 < len(quantile_values):
+                for j in range(i + 1, len(quantile_values)):
+                    if quantile_values[j] is not None:
+                        quantile_values[i] = quantile_values[j]
                         break
-
-        # Map the result back to a dictionary
-        stats = dict(zip(labels, result_list))
 
     # Handle date/time types (e.g., DATE, TIMESTAMP, TIME)
     elif any(date_type in data_type for date_type in ("DATE", "TIMESTAMP", "TIME")):
-        quantile_queries = [
-            f"PERCENTILE_CONT({p}) WITHIN GROUP (ORDER BY {column_name}) AS q_{i}"
-            for i, p in enumerate(quantiles)
-        ]
+        fractions_str = ", ".join(str(f) for f in quantile_fractions)
         query = f"""
-            SELECT 
-                MIN({column_name}) AS min_date,
-                {", ".join(quantile_queries)},
-                MAX({column_name}) AS max_date
+            SELECT quantile_cont("{column_name}", [{fractions_str}])
             FROM {table_name};
         """
         result = con.execute(query).fetchone()
-        stats = dict(zip(labels, result))
+        if result is None or result[0] is None:
+            return None
+        quantile_values = list(result[0])
 
     else:
         return None
 
-    return convert_to_serializable(stats)
+    return convert_quantiles_to_serializable(quantile_values)
+
+
+def convert_quantiles_to_serializable(quantile_values) -> Dict[str, any]:
+    """Convert a list of quantile values to the serializable format expected by the rest of the codebase."""
+    serializable_quantiles = [
+        (
+            float(value) if isinstance(value, Decimal) else
+            value.isoformat() if isinstance(value, (date, datetime)) else
+            value if value is not None else None
+        )
+        for value in quantile_values
+    ]
+    return {"quantiles": serializable_quantiles}
 
 
 def convert_to_serializable(stats) -> Dict[str, any]:

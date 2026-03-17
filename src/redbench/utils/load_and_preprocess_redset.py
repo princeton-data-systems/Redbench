@@ -42,6 +42,7 @@ def load_and_preprocess_redset(
     include_analyze: bool = False,
     include_ctas: bool = False,
     include_all_qtypes: bool = False,
+    include_only_query_types: list = None,
     exclude_tables_never_read: bool = False,
     load_full_redset_and_cache: bool = False,
     con: duckdb.DuckDBPyConnection = None,
@@ -73,6 +74,8 @@ def load_and_preprocess_redset(
 
     # query types to include in the sampling
     query_types = ["select", "insert", "delete", "update"]
+    if include_only_query_types:
+        query_types = [qt for qt in query_types if qt in include_only_query_types]
     if include_copy:
         query_types.append("copy")
     if include_analyze:

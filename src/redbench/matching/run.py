@@ -8,6 +8,7 @@ from utils.load_and_preprocess_redset import determine_redset_dataset_type
 
 from redbench.matching.benchmarks.imdb import IMDbBenchmark
 from redbench.matching.benchmarks.tpcds import TPCDSBenchmark
+from redbench.matching.benchmarks.tpch import TPCHBenchmark
 from redbench.utils.log import log
 
 
@@ -21,6 +22,8 @@ def get_benchmarks_from_config(config):
             benchmarks.append(IMDbBenchmark(config, benchmark_config))
         elif benchmark_config.id.lower() == "tpcds":
             benchmarks.append(TPCDSBenchmark(config, benchmark_config))
+        elif benchmark_config.id.lower() == "tpch":
+            benchmarks.append(TPCHBenchmark(config, benchmark_config))
         else:
             raise ValueError(f"Unsupported benchmark ID: {benchmark_config.id}")
     return benchmarks

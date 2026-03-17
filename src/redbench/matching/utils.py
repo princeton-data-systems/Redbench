@@ -50,6 +50,7 @@ def get_query_timeline(
     end_date,
     redset_exclude_tables_never_read: bool,
     limit_redset_rows_read: int,
+    include_only_query_types: list = None,
 ):
     # load the redset and preprocess it
     con = load_and_preprocess_redset(
@@ -63,6 +64,7 @@ def get_query_timeline(
         include_ctas=False,  # cannot handle ctas
         exclude_tables_never_read=redset_exclude_tables_never_read,
         limit_rows=limit_redset_rows_read,
+        include_only_query_types=include_only_query_types,
     )
 
     res = (

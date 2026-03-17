@@ -1,0 +1,19 @@
+{
+    "support_benchmarks": [
+        {
+            "id": "tpch",
+            "name": "tpch",
+            "stats_table": "tpch_stats",
+            "table_ids_table": "tpch_table_ids",
+            "override": false,
+            "sf": 1
+        }
+    ],
+    "start_date": "2024-03-01 00:00:00",
+    "end_date": "2024-06-01 00:00:00",
+    "matching_method": "join",
+    "redset_exclude_tables_never_read": false,
+    "use_table_versioning": false,
+    "limit_redset_rows_read": null,
+    "include_only_query_types": ["select"]
+}

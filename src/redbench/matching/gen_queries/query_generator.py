@@ -156,6 +156,7 @@ class QueryGenerator:
             self.config.end_date,
             redset_exclude_tables_never_read=redset_exclude_tables_never_read,
             limit_redset_rows_read=self.config.limit_redset_rows_read,
+            include_only_query_types=getattr(self.config, "include_only_query_types", None),
         )
 
         print(f"Loaded {len(query_timeline)} queries from Redset.")

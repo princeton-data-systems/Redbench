@@ -124,12 +124,13 @@ def build_predicate(
             column_type = retrieve_column_type(table_info[column]["type"])
 
             # Determine the exact range size based on sigma
+            num_buckets = len(quantiles) - 1
             range_size = max(
-                0, min(100, int(sigma_scaled * 100))
-            )  # Ensure within 1-100
+                0, min(num_buckets, int(sigma_scaled * num_buckets))
+            )
 
             # Pick a random valid start index so the range fits within bounds
-            start_index = rand_state.randint(0, 100 - range_size + 1)
+            start_index = rand_state.randint(0, num_buckets - range_size + 1)
 
             lower_bound = quantiles[start_index]
             upper_bound = quantiles[start_index + range_size]
