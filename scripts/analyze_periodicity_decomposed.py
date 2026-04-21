@@ -437,6 +437,66 @@ def sort_key_regret(test_matrix, predicted_matrix, switch_cost=SWITCH_COST):
 
 # ── Per-table analysis ──────────────────────────────────────────────────
 
+def classify_segment(train_seg, test_seg):
+    """
+    Fit all models on train_seg, evaluate on test_seg, return category.
+    Returns (category, best_model_name) or (None, None) if insufficient data.
+    """
+    n_cols = train_seg.shape[1]
+    if train_seg.shape[0] < MIN_BINS or test_seg.shape[0] < MIN_BINS:
+        return None, None
+
+    errors = {}
+    # Static
+    static_mean = fit_static_average(train_seg)
+    errors["static"] = median_relative_error(
+        test_seg, predict_static(static_mean, test_seg.shape[0]))
+
+    # Floor and average for each period
+    for name, period_bins in CANDIDATE_PERIODS_BINS.items():
+        if train_seg.shape[0] < 2 * period_bins:
+            continue
+        tmpl = fit_periodic_floor(train_seg, period_bins)
+        errors[f"floor_{name}"] = median_relative_error(
+            test_seg, predict_periodic(tmpl, period_bins, test_seg.shape[0]))
+        tmpl = fit_periodic_average(train_seg, period_bins)
+        errors[f"avg_{name}"] = median_relative_error(
+            test_seg, predict_periodic(tmpl, period_bins, test_seg.shape[0]))
+
+    # Multi-period average
+    viable = [(n, p) for n, p in CANDIDATE_PERIODS_BINS.items()
+              if train_seg.shape[0] >= 2 * p]
+    if len(viable) >= 2:
+        pbl = [p for _, p in viable]
+        om, dt = fit_periodic_average_multi(train_seg, pbl)
+        errors["avg_multi"] = median_relative_error(
+            test_seg, predict_multi(om, dt, pbl, test_seg.shape[0]))
+
+    if not errors:
+        return None, None
+    cat, model, _ = classify_table(errors)
+    return cat, model
+
+
+def three_split_stability(matrix):
+    """
+    Split data into thirds. Classify on seg1→seg2 and seg2→seg3.
+    Returns (cat_12, cat_23, stable_cat) where stable_cat is the category
+    if both agree, else None.
+    """
+    n = matrix.shape[0]
+    s1 = n // 3
+    s2 = 2 * n // 3
+    seg1 = matrix[:s1]
+    seg2 = matrix[s1:s2]
+    seg3 = matrix[s2:]
+
+    cat_12, _ = classify_segment(seg1, seg2)
+    cat_23, _ = classify_segment(seg2, seg3)
+
+    stable = cat_12 if (cat_12 is not None and cat_12 == cat_23) else None
+    return cat_12, cat_23, stable
+
 def analyze_table(tdf):
     """
     Full analysis for one table: build models, evaluate, classify.
@@ -537,10 +597,34 @@ def analyze_table(tdf):
         errors_test[model_name] = median_relative_error(test, predictions[model_name])
 
     # ── Classify by L1 error (using test-set errors) ────────────────────
-    # L1 classification uses test-set error to characterize the table's
-    # workload type: which model generalizes best for this table?
-    # This is a characterization of the workload, not a deployment decision.
+    # Forward direction: train on first half, evaluate on second half.
     category_l1, best_model_l1, best_err_l1 = classify_table(errors_test)
+
+    # ── Reverse direction: train on second half, evaluate on first half ─
+    # This enables a symmetry check: "true" periodic tables are those
+    # classified the same way regardless of which half is used for fitting.
+    rev_models_errors = {"static": median_relative_error(
+        train, predict_static(fit_static_average(test), train.shape[0]))}
+    for name, period_bins in CANDIDATE_PERIODS_BINS.items():
+        if test.shape[0] < 2 * period_bins:
+            continue
+        tmpl = fit_periodic_floor(test, period_bins)
+        rev_models_errors[f"floor_{name}"] = median_relative_error(
+            train, predict_periodic(tmpl, period_bins, train.shape[0]))
+        tmpl = fit_periodic_average(test, period_bins)
+        rev_models_errors[f"avg_{name}"] = median_relative_error(
+            train, predict_periodic(tmpl, period_bins, train.shape[0]))
+    viable_rev = [(n, p) for n, p in CANDIDATE_PERIODS_BINS.items()
+                  if test.shape[0] >= 2 * p]
+    if len(viable_rev) >= 2:
+        pbl = [p for _, p in viable_rev]
+        om, dt = fit_periodic_average_multi(test, pbl)
+        rev_models_errors["avg_multi"] = median_relative_error(
+            train, predict_multi(om, dt, pbl, train.shape[0]))
+    category_rev, _, _ = classify_table(rev_models_errors)
+
+    # True category: same in both directions
+    true_cat = category_l1 if category_l1 == category_rev else None
 
     # Update best_floor/best_avg based on test-set L1
     best_floor_err_test = np.inf
@@ -618,6 +702,9 @@ def analyze_table(tdf):
         y_pct = compute_y_pct(best_avg_template, best_avg_period_bins, test)
         winning_period_name = best_avg_name
 
+    # ── Three-split stability check ────────────────────────────────────
+    cat_12, cat_23, stable_cat = three_split_stability(matrix)
+
     # ── Build prediction for the L1-winning model (for plotting) ────────
     winning_pred = predictions.get(best_model_l1, static_pred_test)
     error_series = relative_l1_error(test, winning_pred)
@@ -630,6 +717,8 @@ def analyze_table(tdf):
         "split": split,
         # L1-based classification (selected on train, reported on test)
         "category": category_l1,
+        "category_rev": category_rev,
+        "true_cat": true_cat,
         "best_model": best_model_l1,
         "best_error": best_err_l1,
         "all_errors": errors_test,
@@ -647,6 +736,10 @@ def analyze_table(tdf):
         "y_pct": y_pct,
         "winning_period_name": winning_period_name,
         "total_skipping_volume": float(matrix.sum()),
+        # Three-split stability
+        "cat_12": cat_12,
+        "cat_23": cat_23,
+        "stable_cat": stable_cat,
         # For plotting
         "matrix": matrix,
         "bin_index": bin_index,
@@ -1039,6 +1132,41 @@ def main():
     lines.append(f"\n  L1 vs regret classification agreement: "
                  f"{agree} / {total_tables} tables ({100*agree/max(1,total_tables):.0f}%)")
 
+    # ── Three-split stability ───────────────────────────────────────────
+    lines.append(f"\n{'=' * 160}")
+    lines.append("THREE-SPLIT STABILITY CHECK")
+    lines.append("(Split into thirds. Classify on seg1→seg2 and seg2→seg3. "
+                 "'Stable' = same category in both windows.)")
+    lines.append(f"{'=' * 160}")
+
+    stable_counts = defaultdict(int)
+    unstable = 0
+    insufficient = 0
+    for _, _, r in all_results:
+        sc = r.get("stable_cat")
+        if sc is not None:
+            stable_counts[sc] += 1
+        elif r.get("cat_12") is None or r.get("cat_23") is None:
+            insufficient += 1
+        else:
+            unstable += 1
+
+    lines.append(f"  Stable Cat 1 (nonstationary in both windows): {stable_counts[1]}")
+    lines.append(f"  Stable Cat 2 (periodic floor in both windows): {stable_counts[2]}")
+    lines.append(f"  Stable Cat 3 (periodic avg in both windows):   {stable_counts[3]}")
+    lines.append(f"  Unstable (different category across windows):  {unstable}")
+    lines.append(f"  Insufficient data for three-split:             {insufficient}")
+
+    # Detail for stable Cat 2 and 3
+    for cat in [2, 3]:
+        stable_tables = [(l, t, r) for l, t, r in all_results if r.get("stable_cat") == cat]
+        if stable_tables:
+            lines.append(f"\n  Stable Cat {cat} tables:")
+            for l, t, r in sorted(stable_tables, key=lambda x: -x[2]["y_pct"]):
+                lines.append(f"    {l:>20s} / {t:>15s}: Y%={r['y_pct']:.1%}  "
+                             f"L1={r['best_error']:.3f}  period={r['winning_period_name'] or '—'}  "
+                             f"vol={r['total_skipping_volume']:.0f}")
+
     output = "\n".join(lines)
     print(output)
 
@@ -1076,6 +1204,9 @@ def main():
             "regret_best_regret": r["best_regret"],
             "regret_static_train": r["regrets_train"].get("static", 0),
             "oracle_benefit": r["oracle_benefit"],
+            "stable_cat": r.get("stable_cat"),
+            "cat_12": r.get("cat_12"),
+            "cat_23": r.get("cat_23"),
             "n_cols": r["n_cols"],
             "n_bins": r["n_bins"],
             "total_skipping_volume": r["total_skipping_volume"],
