@@ -18,15 +18,23 @@
    - [Why Provisioned Cluster 158 Has Higher JSD](#why-provisioned-cluster-158-has-higher-jsd)
    - [Volume Caveat](#volume-caveat)
    - [Recommendation](#recommendation)
-7. [Matching Workload Analysis](#matching-workload-analysis)
+7. [Periodic Workload Analysis for Sort Key Optimization](#periodic-workload-analysis-for-sort-key-optimization)
+   - [Motivation](#motivation)
+   - [Methodology](#methodology)
+   - [Results: Category Distribution](#results-category-distribution)
+   - [Results: Serverless Cluster 104](#results-serverless-cluster-104)
+   - [Results: High-Volume Clusters](#results-high-volume-clusters)
+   - [Results: Provisioned Clusters](#results-provisioned-clusters)
+   - [Implications for Sort Key Optimization](#implications-for-sort-key-optimization)
+8. [Matching Workload Analysis](#matching-workload-analysis)
    - [IMDB Matching](#imdb-matching)
    - [TPC-H Matching](#tpc-h-matching)
    - [Why Matching Underperforms Generation](#why-matching-underperforms-generation)
-8. [Discussion](#discussion)
+9. [Discussion](#discussion)
    - [Why Generation Produces Temporal Drift](#why-generation-produces-temporal-drift)
    - [Selectivity Model and Limitations](#selectivity-model-and-limitations)
    - [Dataset Choice: TPC-DS and Beyond](#dataset-choice-tpc-ds-and-beyond)
-9. [Appendix](#appendix)
+10. [Appendix](#appendix)
    - [A. Jensen-Shannon Divergence](#a-jensen-shannon-divergence)
    - [B. IMDb Table Sizes](#b-imdb-table-sizes)
    - [C. Redbench Filter Generation Details](#c-redbench-filter-generation-details)
@@ -62,6 +70,8 @@ We measure temporal variability using the pruning-weighted Jensen-Shannon Diverg
 **Recommended approach:** Use IMDB cluster 104 for the strongest temporal dynamics (highest JSD), and TPC-H cluster 104 at higher scale factors for performance-sensitive evaluation where table size matters. Provisioned Redset cluster 158 achieves even higher JSD (0.743 for `title`, vs 0.580 for serverless cluster 104) but at lower per-day volume; see [Provisioned Cluster Results](#provisioned-cluster-results).
 
 **Important realism caveat:** Generation produces filter diversity by round-robin cycling through all columns of each mapped table. This means the number of distinct filter columns per table is close to the total number of columns in that table, and every column gets filtered on with roughly equal long-run frequency. Real workloads typically concentrate filters on a small subset of columns (e.g., date columns, primary keys). This is a significant limitation, but largely unavoidable: Redset does not include column-level access statistics, so there is no signal to determine which columns a real query filtered on. The temporal *shift* patterns (which columns dominate in which time periods) are still realistic, since they derive from real Redset QIG timing.
+
+**Periodic workload analysis:** A train/test evaluation framework classifies each table's workload by which prediction model (static average, periodic floor, or periodic average) best forecasts the held-out second half. Using test-set L1 error (workload characterization), 60% of 178 tables are nonstationary, 31% have a periodic floor, and 10% are fully stationary. However, when measured by sort key regret (model selected on the train set, evaluated on the test set), no periodic model beats the static baseline — the static model's sort key choice is already nearly optimal (median regret 0.074 vs 0.079 for the best periodic model). Periodic structure is real and detectable by L1, but the sort key decision is too coarse (pick one column) for periodic models to improve on "pick the globally best column." See [Periodic Workload Analysis for Sort Key Optimization](#periodic-workload-analysis-for-sort-key-optimization).
 
 ---
 
@@ -314,6 +324,230 @@ Provisioned cluster 49 illustrates this: it has the highest per-table volume amo
 ### Recommendation
 
 Provisioned cluster 158 is the strongest candidate if the goal is to maximize temporal variability in filter patterns, even at the cost of lower per-day query volume. For a balanced volume-and-variability profile, serverless cluster 104 remains the best choice. Both could be used together: cluster 158 for stress-testing adaptation speed, and cluster 104 for steady-state evaluation with higher statistical confidence.
+
+---
+
+
+## Periodic Workload Analysis for Sort Key Optimization
+
+### Motivation
+
+The JSD analysis in previous sections measures *how much* the filter distribution shifts between consecutive time windows, but does not address a more practical question: can we predict these shifts well enough to optimize sort keys proactively? If a table's filtering workload follows a predictable daily or weekly cycle, a system could schedule sort key changes to track the cycle. If the workload is unpredictable, the best strategy is a static sort key based on the overall average.
+
+This section frames the question as a forecasting problem. We build three models of increasing complexity, evaluate each on held-out data, and classify each table by which model best predicts its future workload. The classification directly determines the optimization strategy.
+
+### Methodology
+
+**Skipping volume vectors.** For each table, we construct a time series at 6-hour granularity. Each observation is a vector where component *i* is the total skipping volume for column *i* during that 6-hour bin — this is the same pruning-weighted volume used throughout this report, `sum(1 − selectivity)`, aggregated per column per bin. We use 6-hour bins rather than hourly to avoid sparsity (many hours have zero queries for a given column, which collapses quantile-based models). For a 91-day observation window, this produces ~364 bins per table.
+
+**Train/test split.** The time series is split in half chronologically: the first half is the training period (~45 days), the second half is the test period (~45 days).
+
+**Periodic vs aperiodic, stationary vs nonstationary.** The workload on any table is a superposition of two types of variation:
+
+- *Periodic patterns* repeat at a fixed interval (daily, weekly, etc.). They tend to be caused by scheduled infrastructure: cron jobs, ETL pipelines, dashboards that refresh on a fixed schedule. These don't change without someone deliberately changing them, so they are likely *stationary* — their statistical properties persist into the future.
+- *Aperiodic patterns* are everything else: long-term trends, one-off events, ad-hoc analyst queries. These come and go unpredictably, so they are likely *nonstationary* — they cannot be reliably predicted from historical data.
+
+Crossing these two axes gives four theoretical combinations, but only three are practically relevant:
+
+1. *Periodic + stationary, aperiodic + nonstationary* (Category 2): The periodic component persists reliably and acts as a floor — the minimum workload you'd see even if all ad-hoc activity stopped. The aperiodic component adds non-negative volume on top but is unpredictable.
+2. *Both periodic and aperiodic are stationary* (Category 3): The full workload pattern, including the average level of ad-hoc activity, persists into the future. This can happen when many independent ad-hoc users collectively produce a stable aggregate rate.
+3. *Everything is nonstationary* (Category 1): Neither periodic nor aperiodic patterns persist. The best prediction is the overall historical average.
+
+The fourth combination — *periodic but nonstationary* (e.g., a cron job that gets decommissioned mid-observation) — is theoretically possible but unlikely to be the dominant pattern for a table. If the periodic component breaks down, the table effectively becomes Category 1.
+
+**Three models** correspond to these three categories:
+
+*Model 1: Static Average (Category 1).* Compute the mean skipping volume vector across all training bins. Predict this same vector for every test bin. This is the baseline — it captures the overall workload level but no temporal structure.
+
+*Model 2: Periodic Floor (Category 2).* For each candidate period (daily = 4 bins, 2-day = 8 bins, weekly = 28 bins, 2-week = 56 bins), fold the training data by phase: group all bins that fall at the same point in the cycle (e.g., all "Monday 06:00–12:00" bins together). Compute the 25th percentile of each column's skipping volume within each phase bin, then smooth with a circular moving average (window of 3 bins). This produces a conservative floor template — the minimum workload you'd expect at each point in the cycle even if all ad-hoc activity stopped. Predict by tiling this template across the test period.
+
+*Model 3: Periodic Average (Category 3).* Same folding procedure as Model 2, but compute the mean instead of a low quantile. This captures the full average workload pattern, including the typical level of ad-hoc activity. We also test a multi-period variant that additively combines deviations from the overall mean across all candidate periods.
+
+**Evaluation metric 1: Relative L1 error.** For each test bin *t*, compute:
+
+> error(t) = |v(t) − v̂(t)|₁ / |v(t)|₁
+
+where |·|₁ is the sum of absolute values across all columns. Since v is not normalized, this error is unbounded — it can be arbitrarily large when the prediction vector points in a very different direction from the observed vector (e.g., predicting all volume on column A when it's actually spread across columns B and C). The model's score is the median relative error across all test bins with nonzero observed volume.
+
+This metric has a known limitation: it penalizes models for failing to predict ad-hoc query bursts, even though the whole point of isolating the periodic pattern is to deliberately ignore those bursts. A floor model that perfectly captures the periodic component will still show high L1 error because it undershoots every bin where ad-hoc activity adds volume above the floor. We therefore also use a second metric that directly measures downstream utility.
+
+**Evaluation metric 2: Sort key regret.** This metric asks: if we used the model's predictions to choose sort keys, how much worse would we do compared to an oracle with perfect knowledge?
+
+The cost model: at each 6-hour bin, the table has one sort key (a single column). The benefit of the sort key is the skipping volume for that column in that bin — data pruning is only possible if the sort key matches the filtered column. Changing the sort key between consecutive bins costs a fixed amount C (set to 50, representing the overhead of re-sorting or re-clustering the table). The optimal sort key schedule is found by dynamic programming over the test period.
+
+Regret is defined as:
+
+> regret = 1 − (policy_benefit / oracle_benefit)
+
+where oracle_benefit is the total benefit (skipping volume minus switch costs) of the optimal schedule computed with perfect knowledge of the test data, and policy_benefit is the benefit of the schedule computed from the model's predictions but evaluated on the actual test data. A regret of 0 means the model's schedule matches the oracle; a regret of 1 means the model captures none of the oracle's benefit.
+
+**Classification.** The table is classified based on which model achieves the lowest median L1 error, with a simplicity preference: if a simpler model is within 3 percentage points of the best, we prefer it.
+
+- **Category 1 (Completely Nonstationary):** Static average wins.
+- **Category 2 (Stationary Periodic, Nonstationary Aperiodic):** Periodic floor wins.
+- **Category 3 (Completely Stationary):** Periodic average wins.
+
+We also report the *classification margin*: the L1 error gap between the winning category and the runner-up. A narrow margin (< 0.03) means the table doesn't clearly belong to one category over another.
+
+**Y% metric.** For Category 2 and 3 tables, Y% measures the fraction of total test-period skipping volume captured by the periodic model's predictions, where each bin's prediction is clipped to not exceed the observed value. Y% is less than 100% even for Category 3 tables because the periodic average undershoots bins where the observed volume spikes above the historical mean — the prediction captures the typical level but not the peaks.
+
+### Results: Category Distribution
+
+We classify each table twice: once using median L1 error, once using sort key regret. Both classifications use the same three models and the same simplicity preference (within 3 percentage points, prefer the simpler model).
+
+The two classifications differ in what data they use for model selection:
+
+- L1 classification selects the model with the lowest L1 error on the test period. This uses future data that wouldn't be available in practice, so it characterizes the table's workload type (what kind of model *would* work best if we had an oracle) rather than making a deployment recommendation.
+- Regret classification selects the model with the lowest sort key regret on the train period, then reports that model's regret on the test period. This simulates a realistic deployment: choose a model based on historical data, then see how it performs on future data.
+
+**L1-based classification** (model selected by test-set L1 error — workload characterization):
+
+| Category | Tables | % of Tables | Skipping Volume | % of Volume |
+|----------|-------:|------------:|----------------:|------------:|
+| 1: Completely Nonstationary | 106 | 59.6% | 1,379,140 | 44.3% |
+| 2: Stationary Periodic | 55 | 30.9% | 877,209 | 28.2% |
+| 3: Completely Stationary | 17 | 9.6% | 859,318 | 27.6% |
+
+**Regret-based classification** (model selected by train-set regret; reported numbers are test-set regret of that model):
+
+| Category | Tables | % of Tables | Skipping Volume | % of Volume |
+|----------|-------:|------------:|----------------:|------------:|
+| 1: Completely Nonstationary | 153 | 86.0% | 1,273,333 | 40.9% |
+| 2: Stationary Periodic | 3 | 1.7% | 575,319 | 18.5% |
+| 3: Completely Stationary | 22 | 12.4% | 1,267,015 | 40.7% |
+
+The two classifications agree on only 56% of tables. The regret-based view is far more dominated by Category 1 (86% vs 60% by L1) and nearly eliminates Category 2 (3 tables vs 55). This happens because the sort key decision is a coarse argmax — "which column has the most volume this bin?" — and the static model often gets this right even when its full-vector prediction is poor. The periodic floor model, which is the most common L1 winner, rarely produces a different sort key choice than static because the floor's dominant column tends to be the same as the overall average's dominant column.
+
+Dominant periods among L1-classified Category 2+3 tables:
+
+| Period | Tables |
+|--------|-------:|
+| Daily (24h) | 36 |
+| 2-day (48h) | 15 |
+| Weekly (168h) | 12 |
+| 2-week (336h) | 9 |
+
+Y% distribution for L1-classified Category 2+3 tables: mean 21.0%, median 9.8%, p25 0.0%, p75 40.9%.
+
+**L1 prediction error** (median relative L1 error of the L1-winning model, measured on the test period, restricted to tables of each L1-category):
+
+| L1-Category | Tables | Mean Error | Median Error | Min | Max |
+|-------------|-------:|----------:|-------------:|----:|----:|
+| 1: Nonstationary | 106 | 0.847 | 0.904 | 0.254 | 1.025 |
+| 2: Periodic Floor | 55 | 0.882 | 0.984 | 0.261 | 1.000 |
+| 3: Stationary | 17 | 0.665 | 0.623 | 0.345 | 0.981 |
+
+L1 errors are high across all categories. Since v is not normalized, the relative L1 error is unbounded — it can be arbitrarily large when the prediction vector points in a very different direction from the observed vector. However, L1 error penalizes models for failing to predict ad-hoc query bursts, even though the whole point of isolating the periodic pattern is to deliberately ignore those bursts. The regret metric addresses this limitation by measuring downstream utility directly.
+
+**Sort key regret by regret-category** (model selected by train-set regret; test-set regret of that model, restricted to tables of each regret-category):
+
+| Regret-Category | Tables | Mean Regret | Median Regret |
+|-----------------|-------:|----------:|-------------:|
+| 1: Nonstationary | 153 | 0.129 | 0.044 |
+| 2: Periodic Floor | 3 | 0.299 | 0.281 |
+| 3: Stationary | 22 | 0.865 | 0.714 |
+
+Regret-Category 1 tables (where the static model wins on train-set regret) have low test-set regret (median 0.044): the static sort key loses only 4.4% of the oracle's benefit. Regret-Category 3 tables have high test-set regret (median 0.714), meaning the periodic average model selected on the train set generalizes poorly to the test period's sort key structure — the train-set regret was a misleading signal for these tables.
+
+**Sort key regret of each model type across all 178 tables** (all models trained on the first half; regret evaluated on the second half):
+
+| Model | Mean Regret | Median Regret |
+|-------|----------:|-------------:|
+| Oracle (DP on actual test data) | 0.000 | 0.000 |
+| Static (train mean → single column → test) | 0.180 | 0.074 |
+| Best-regret (model selected by train regret → test) | 0.223 | 0.079 |
+| Best-L1 (model selected by test L1 → test) | 0.188 | 0.080 |
+
+Neither model selection strategy beats the static baseline on sort key regret. The best-regret model (selected by train-set regret, median 0.079) and the best-L1 model (selected by test-set L1, median 0.080) both perform slightly worse than static (0.074). The train-set regret signal does not generalize: the model that has lowest regret on the train period is not reliably the one with lowest regret on the test period. And L1 error, even when measured on the test set, does not predict sort key performance.
+
+**Classification confidence.** The L1 classification margin is narrow for 56% of tables (99/178 below 0.03). The regret classification is far less decisive: 88% of tables (156/178) have a narrow margin. The categories should be understood as a soft spectrum rather than sharp bins, especially for the regret-based view.
+
+### Results: Serverless Cluster 104
+
+Cluster 104 (the recommended cluster) shows a representative mix across both IMDB and TPC-H:
+
+**IMDB tables on cluster 104:**
+
+| Table | Cat | Best Model | Med Error | Y% | Period | Skip Vol |
+|-------|:---:|-----------|----------:|---:|--------|--------:|
+| cast_info | 1 | static | 0.341 | — | — | 233,907 |
+| person_info | 1 | static | 0.699 | — | — | 505 |
+| keyword | 2 | floor_2-week | 0.838 | 32.3% | 2-week | 980 |
+| company_name | 3 | avg_daily | 0.841 | 33.3% | daily | 444 |
+| movie_info | 2 | floor_daily | 0.935 | 6.7% | daily | 35,905 |
+| aka_title | 2 | floor_daily | 0.941 | 5.2% | daily | 1,357 |
+| name | 2 | floor_2-week | 0.975 | 7.8% | 2-week | 1,038 |
+| aka_name | 2 | floor_weekly | 0.993 | 3.0% | weekly | 40,830 |
+| char_name | 2 | floor_2-day | 0.998 | 0.8% | 2-day | 27,141 |
+| title | 2 | floor_2-day | 1.000 | 0.2% | 2-day | 31,139 |
+
+`cast_info` — the highest-volume table (234K skipping volume) — is Category 1: its two filter columns (`nr_order` and `note`) have a stable enough mix that the static average is the best predictor (error 0.341, the lowest of any table). This makes sense for a table dominated by just two columns with roughly equal volume.
+
+`keyword` and `company_name` are the most interesting: `keyword` has a 2-week periodic floor capturing 32.3% of its skipping volume, and `company_name` is fully stationary with the daily average capturing 33.3%. These are lower-volume tables, but they demonstrate that periodic optimization is viable.
+
+The high-volume tables (`aka_name`, `char_name`, `title`, `movie_info`) are all Category 2 with daily or weekly floors, but their Y% values are low (0.2–6.7%). The periodic floor exists but is small relative to the large aperiodic spikes that dominate these tables' workloads.
+
+**TPC-H tables on cluster 104:**
+
+| Table | Cat | Best Model | Med Error | Y% | Period | Skip Vol |
+|-------|:---:|-----------|----------:|---:|--------|--------:|
+| nation | 1 | static | 0.531 | — | — | 2,078 |
+| partsupp | 1 | static | 0.541 | — | — | 2,468 |
+| region | 3 | avg_daily | 0.903 | 44.1% | daily | 465 |
+| lineitem | 2 | floor_weekly | 0.913 | 14.0% | weekly | 209,939 |
+| customer | 2 | floor_2-week | 0.915 | 18.9% | 2-week | 3,034 |
+| supplier | 2 | floor_weekly | 0.939 | 11.0% | weekly | 79,417 |
+| part | 2 | floor_weekly | 0.969 | 7.8% | weekly | 92,122 |
+| orders | 2 | floor_2-week | 0.974 | 8.8% | 2-week | 50,931 |
+
+TPC-H on cluster 104 shows a mix of weekly and 2-week periodicity. The four largest tables (`lineitem`, `supplier`, `part`, `orders`) all have periodic floors with Y% ranging from 7.8% to 18.9%. `customer` picks up a 2-week cycle (Y%=18.9%), and `region` is the only Category 3 table, with a daily average capturing 44.1% of its (small) skipping volume.
+
+### Results: High-Volume Clusters
+
+The clusters with the strongest periodic signals (highest Y%) tend to be those with moderate-to-high volume:
+
+| Cluster | Table | Cat | Best Model | Med Error | Y% | Period | Skip Vol |
+|---------|-------|:---:|-----------|----------:|---:|--------|--------:|
+| IMDB prov-4 | movie_info | 2 | floor_daily | 0.400 | 79.7% | daily | 5,527 |
+| IMDB prov-109 | cast_info | 2 | floor_2-day | 0.270 | 77.3% | 2-day | 6,630 |
+| IMDB prov-49 | keyword | 3 | avg_daily | 0.345 | 72.2% | daily | 8,581 |
+| TPC-H srvl-55 | supplier | 3 | avg_2-day | 0.528 | 67.8% | 2-day | 30,025 |
+| IMDB prov-49 | char_name | 3 | avg_daily | 0.497 | 64.8% | daily | 10,481 |
+| TPC-H srvl-55 | nation | 3 | avg_2-day | 0.557 | 51.4% | 2-day | 20,073 |
+| IMDB srvl-55 | cast_info | 3 | avg_2-day | 0.535 | 51.3% | 2-day | 222,504 |
+| TPC-H srvl-55 | lineitem | 3 | avg_2-day | 0.559 | 51.2% | 2-day | 259,789 |
+| IMDB prov-109 | char_name | 2 | floor_2-week | 0.629 | 50.2% | 2-week | 2,273 |
+| IMDB prov-4 | keyword | 2 | floor_weekly | 0.641 | 50.2% | weekly | 744 |
+
+Serverless cluster 55 and provisioned clusters 4, 49, and 109 stand out. Cluster 55's `cast_info` (222K skipping volume, Y%=51.3%) and `lineitem` (260K, Y%=51.2%) are both Category 3 with 2-day cycles — meaning the full average pattern persists reliably. These are the strongest candidates for aggressive time-varying sort key optimization.
+
+Provisioned cluster 4's `movie_info` achieves the highest Y% of any table (79.7%) with a daily floor and a low prediction error (0.400). Provisioned cluster 109's `cast_info` (77.3%, 2-day floor, error 0.270) is also notable — the lowest error of any periodic table.
+
+### Results: Provisioned Clusters
+
+| Cluster | Cat 1 | Cat 2 | Cat 3 | Best Table | Best Y% |
+|---------|------:|------:|------:|-----------|--------:|
+| prov-4 | 6 | 4 | 0 | movie_info | 79.7% |
+| prov-109 | 8 | 2 | 0 | cast_info | 77.3% |
+| prov-49 | 3 | 3 | 4 | keyword | 72.2% |
+| prov-100 | 5 | 5 | 0 | keyword | 44.0% |
+| prov-158 | 1 | 4 | 0 | aka_name | 0.0% |
+
+Provisioned cluster 4 is notable: its `movie_info` table has a daily floor capturing nearly 80% of skipping volume, making it the single best table for demonstrating periodic sort key optimization. Cluster 109's `cast_info` achieves 77.3% with a 2-day floor. However, most of these clusters' tables are nonstationary.
+
+Cluster 158 — which had the highest JSD of any cluster (0.743 for `title`) — is mostly Category 2 with very low Y% values. Its high JSD reflects large aperiodic shifts, not periodic ones. The workload changes dramatically but unpredictably, making it a stress test for reactive adaptation rather than periodic optimization.
+
+### Implications for Sort Key Optimization
+
+The dual-metric analysis reveals a gap between prediction accuracy and decision quality:
+
+By L1 error (characterizing which model best predicts the full workload vector on the test period), 40% of tables benefit from periodic models, and these tables account for 56% of total skipping volume. But when we measure what matters for sort key selection — regret relative to an oracle — no model selection strategy beats the static baseline (median regret 0.074 for static vs 0.079 for the best periodic model selected on the train set). The periodic models' advantage in predicting the full distribution shape does not translate into better sort key decisions, because the sort key choice is a coarse argmax that the static model already gets right.
+
+This does not mean periodic structure is useless. It means that for the specific decision of choosing a single sort key column per time bin, the static model is a surprisingly strong baseline. The periodic models' advantage would matter more for richer decisions — multi-column sort keys, zone map configuration, or materialized view selection — where the full distribution matters, not just the argmax.
+
+The practical strategy for sort key optimization is simple: pick the column with the highest overall skipping volume from recent history and re-evaluate periodically (e.g., monthly). More sophisticated periodic models are unlikely to improve sort key decisions unless the decision granularity becomes finer (e.g., choosing different sort keys for different partitions or time ranges within a single table).
+
+For the recommended configurations: serverless cluster 104 provides a natural mix of all three L1-categories across its tables. Serverless cluster 55 and provisioned clusters 4, 49, and 109 provide the strongest individual periodic tables (Y% > 50%) for experiments where the full distribution matters.
 
 ---
 
@@ -629,11 +863,14 @@ uv run python scripts/analyze_proportional_shift.py --dataset all
 # Selectivity-aware analysis (pruning-weighted JSD)
 uv run python scripts/analyze_selectivity.py --dataset all
 
+# Periodic workload analysis for sort key optimization
+uv run python scripts/analyze_periodicity_decomposed.py --dataset all
+
 # Matching analysis (if matching workloads were generated)
 uv run python scripts/analyze_matching.py
 ```
 
-Analysis outputs (text reports and plots) are written to `work/output/proportional_analysis/`, `work/output/selectivity_analysis/`, and `work/output/matching_analysis/`.
+Analysis outputs (text reports and plots) are written to `work/output/proportional_analysis/`, `work/output/selectivity_analysis/`, `work/output/periodicity_decomposed/`, and `work/output/matching_analysis/`.
 
 **Step 6: Generate PDF**
 
@@ -658,6 +895,7 @@ scripts/                    # Run and analysis scripts
   run_prov_sampled.sh       #   Provisioned IMDB generation (sampled)
   analyze_proportional_shift.py  # Count-based JSD analysis
   analyze_selectivity.py    #   Selectivity-weighted JSD analysis
+  analyze_periodicity_decomposed.py # Periodic workload analysis for sort key optimization
   analyze_matching.py       #   Matching workload analysis
   setup_tpch.py             #   TPC-H data generator
   sample_provisioned.py     #   Provisioned cluster sampler
